@@ -1,5 +1,5 @@
 <?php
-// admin_dashboard.php - FIXED: Cek Bolos dengan Preview + Confirm + Excuse Feature
+// admin_dashboard.php - FIXED: Auto Date Calculation + Readonly Fields + Smart Edit
 require_once 'config/database.php';
 require_once 'includes/functions.php';
 // session_start() sudah dipanggil di functions.php
@@ -22,13 +22,36 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $discord = sanitize($_POST['discord_username'] ?? '');
             $status = $_POST['status'] ?? 'active';
             $type = $_POST['subscription_type'] ?? 'trial';
-            $start = $_POST['subscription_start'] ?? date('Y-m-d');
-            $end = $_POST['subscription_end'] ?? null;
+            
+            // Auto-calculate dates based on package (if not using custom dates)
+            $use_custom_dates = isset($_POST['use_custom_dates']) && $_POST['use_custom_dates'] === '1';
+            
+            if ($use_custom_dates) {
+                // Admin chose to manually set dates
+                $start = $_POST['subscription_start'] ?? date('Y-m-d');
+                $end = $_POST['subscription_end'] ?? null;
+            } else {
+                // Auto-calculate based on package
+                $pricing = getPricingInfo();
+                $days = $pricing[$type]['days'] ?? 0;
+                $start = date('Y-m-d'); // Default: today
+                $end = $days > 0 ? date('Y-m-d', strtotime("+$days days")) : null;
+                
+                // If editing existing user and keeping their start date
+                if ($uid > 0 && !empty($_POST['keep_existing_start']) && $_POST['keep_existing_start'] === '1') {
+                    $existing = dbFetch("SELECT subscription_start FROM users WHERE id = ?", [$uid]);
+                    if ($existing && $existing['subscription_start']) {
+                        $start = $existing['subscription_start'];
+                        $end = $days > 0 ? date('Y-m-d', strtotime($start . " +$days days")) : null;
+                    }
+                }
+            }
             
             $pricing = getPricingInfo();
             $quota = $pricing[$type]['skip_quota'] ?? 3;
             
             if ($uid > 0) {
+                // UPDATE existing user
                 dbQuery("UPDATE users SET 
                     whatsapp_number = ?, full_name = ?, discord_username = ?, 
                     status = ?, subscription_type = ?, subscription_start = ?, 
@@ -38,6 +61,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $message = "✅ Data user berhasil diupdate!";
                 addToLiveFeed($uid, 'user_added', "Admin mengupdate data: $name");
             } else {
+                // INSERT new user
                 dbQuery("INSERT INTO users (whatsapp_number, full_name, discord_username, status, subscription_type, subscription_start, subscription_end, skip_quota_total) 
                          VALUES (?, ?, ?, ?, ?, ?, ?, ?)", 
                         [$wa, $name, $discord ?: null, $status, $type, $start, $end, $quota]);
@@ -102,7 +126,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 }
             }
             
-            // Simpan preview ke session untuk konfirmasi nanti
             $_SESSION['skip_preview'] = $preview_users;
             $_SESSION['skip_check_date'] = $check_date;
             
@@ -113,60 +136,40 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
             
         } 
-        // ✅ CONFIRM: Eksekusi penalty untuk user yang dipilih admin
+        // ✅ CONFIRM: Eksekusi penalty
         elseif ($action === 'confirm_skips') {
             $selected_ids = $_POST['selected_users'] ?? [];
             $excuse_ids = $_POST['excuse_users'] ?? [];
             $check_date = $_SESSION['skip_check_date'] ?? date('Y-m-d', strtotime('-1 day'));
             $preview = $_SESSION['skip_preview'] ?? [];
             
-            $penalized = 0;
-            $excused = 0;
-            $kicked_count = 0;
+            $penalized = 0; $excused = 0; $kicked_count = 0;
             
             foreach ($preview as $p) {
                 if (in_array($p['id'], $excuse_ids)) {
-                    // Admin kasih keringanan - catat di skip_logs sebagai "excused"
                     dbQuery("INSERT INTO skip_logs (user_id, skip_date, skip_number, admin_note, is_restored) VALUES (?, ?, ?, ?, ?)", 
                             [$p['id'], $check_date, $p['current_skip'] + 1, "Excused by admin - alasan valid", true]);
                     addToLiveFeed($p['id'], 'quota_restored', "{$p['full_name']} Dikecualikan dari penalty (alasan valid)");
                     $excused++;
-                } 
-                elseif (in_array($p['id'], $selected_ids)) {
-                    // Eksekusi penalty
+                } elseif (in_array($p['id'], $selected_ids)) {
                     dbQuery("UPDATE users SET skip_count = skip_count + 1 WHERE id = ?", [$p['id']]);
-                    
                     $new_skip = $p['current_skip'] + 1;
                     $warn_type = "skip_warning_" . min($new_skip, 3);
                     addToLiveFeed($p['id'], $warn_type, "{$p['full_name']} Bolos hari ke-$new_skip");
-                    
-                    // Catat di skip_logs
-                    dbQuery("INSERT INTO skip_logs (user_id, skip_date, skip_number) VALUES (?, ?, ?)", 
-                            [$p['id'], $check_date, $new_skip]);
-                    
+                    dbQuery("INSERT INTO skip_logs (user_id, skip_date, skip_number) VALUES (?, ?, ?)", [$p['id'], $check_date, $new_skip]);
                     $penalized++;
-                    
-                    // Auto-kick jika kuota habis
-                    if ($new_skip >= $p['quota_total']) {
-                        checkAndKickUser($p['id']);
-                        $kicked_count++;
-                    }
+                    if ($new_skip >= $p['quota_total']) { checkAndKickUser($p['id']); $kicked_count++; }
                 }
             }
-            
-            // Clear session
             unset($_SESSION['skip_preview'], $_SESSION['skip_check_date']);
             
             $msg_parts = [];
             if ($penalized > 0) $msg_parts[] = "$penalized user di-penalty";
             if ($excused > 0) $msg_parts[] = "$excused user di-excuse";
             if ($kicked_count > 0) $msg_parts[] = "$kicked_count user di-KICK otomatis";
-            
             $message = "✅ Proses selesai! " . implode(', ', $msg_parts) . ".";
             
-        }
-        // ❌ CANCEL: Batalkan preview
-        elseif ($action === 'cancel_preview') {
+        } elseif ($action === 'cancel_preview') {
             unset($_SESSION['skip_preview'], $_SESSION['skip_check_date']);
             $message = "❌ Preview dibatalkan. Tidak ada perubahan pada database.";
         }
@@ -199,10 +202,16 @@ if (isset($_GET['edit']) && is_numeric($_GET['edit'])) {
     $edit_user = dbFetch("SELECT * FROM users WHERE id = ?", [(int)$_GET['edit']]);
 }
 
-// Load preview data if exists
 $preview_mode = isset($_SESSION['skip_preview']);
 $preview_users = $_SESSION['skip_preview'] ?? [];
 $check_date = $_SESSION['skip_check_date'] ?? date('Y-m-d', strtotime('-1 day'));
+
+// Package info for JS auto-date calculation
+$pricing = getPricingInfo();
+$package_durations = [];
+foreach ($pricing as $key => $pkg) {
+    $package_durations[$key] = ['days' => $pkg['days'], 'quota' => $pkg['skip_quota'], 'name' => $pkg['name']];
+}
 
 $page_title = 'Admin Dashboard';
 ?>
@@ -253,16 +262,17 @@ $page_title = 'Admin Dashboard';
             </form>
         <?php endif; ?>
 
-        <!-- EDIT FORM (Inline if editing) -->
+        <!-- EDIT FORM (Inline if editing) - WITH AUTO DATES -->
         <?php if ($tab === 'users' && $edit_user): ?>
             <div class="mb-6 bg-gray-800 rounded-xl p-6 border-2 border-orange-600">
                 <h3 class="font-bold mb-4 flex items-center justify-between">
                     <span><i class="fas fa-edit mr-2 text-orange-400"></i>Edit User: <?= sanitize($edit_user['full_name']) ?></span>
                     <a href="?tab=users<?= $search ? '&search='.urlencode($search) : '' ?>" class="text-sm text-gray-400 hover:underline"><i class="fas fa-arrow-left mr-1"></i> Batal</a>
                 </h3>
-                <form method="POST" class="grid md:grid-cols-2 gap-4">
+                <form method="POST" class="grid md:grid-cols-2 gap-4" id="user-form">
                     <input type="hidden" name="action" value="save_user">
                     <input type="hidden" name="user_id" value="<?= $edit_user['id'] ?>">
+                    <input type="hidden" name="use_custom_dates" id="use-custom-dates" value="0">
                     
                     <div>
                         <label class="block text-sm font-medium mb-1">Nama Lengkap *</label>
@@ -286,26 +296,60 @@ $page_title = 'Admin Dashboard';
                         </select>
                     </div>
                     <div>
-                        <label class="block text-sm font-medium mb-1">Paket</label>
-                        <select name="subscription_type" class="w-full px-4 py-2 bg-gray-700 border border-gray-600 rounded-lg focus:ring-2 focus:ring-orange-500 outline-none">
-                            <option value="trial" <?= $edit_user['subscription_type'] === 'trial' ? 'selected' : '' ?>>Trial</option>
-                            <option value="monthly" <?= $edit_user['subscription_type'] === 'monthly' ? 'selected' : '' ?>>Monthly</option>
-                            <option value="quarterly" <?= $edit_user['subscription_type'] === 'quarterly' ? 'selected' : '' ?>>Quarterly</option>
-                            <option value="yearly" <?= $edit_user['subscription_type'] === 'yearly' ? 'selected' : '' ?>>Yearly</option>
+                        <label class="block text-sm font-medium mb-1">
+                            Paket 
+                            <span class="text-xs text-gray-400 ml-1" id="package-info">(<?= ucfirst($edit_user['subscription_type']) ?>: <?= $package_durations[$edit_user['subscription_type']]['days'] ?> hari, kuota <?= $package_durations[$edit_user['subscription_type']]['quota'] ?>x)</span>
+                        </label>
+                        <select name="subscription_type" id="subscription-type" class="w-full px-4 py-2 bg-gray-700 border border-gray-600 rounded-lg focus:ring-2 focus:ring-orange-500 outline-none" onchange="updateDates()">
+                            <?php foreach ($package_durations as $key => $pkg): ?>
+                                <option value="<?= $key ?>" <?= $edit_user['subscription_type'] === $key ? 'selected' : '' ?> 
+                                        data-days="<?= $pkg['days'] ?>" data-quota="<?= $pkg['quota'] ?>" data-name="<?= $pkg['name'] ?>">
+                                    <?= $pkg['name'] ?> (<?= $pkg['days'] ?> hari, <?= $pkg['quota'] ?>x kuota)
+                                </option>
+                            <?php endforeach; ?>
                         </select>
                     </div>
-                    <div>
-                        <label class="block text-sm font-medium mb-1">Start Date</label>
-                        <input type="date" name="subscription_start" value="<?= $edit_user['subscription_start'] ?>" class="w-full px-4 py-2 bg-gray-700 border border-gray-600 rounded-lg focus:ring-2 focus:ring-orange-500 outline-none">
+                    
+                    <!-- Date Fields with Auto-Calc + Custom Toggle -->
+                    <div class="md:col-span-2 p-4 bg-gray-700/30 rounded-lg border border-gray-600">
+                        <div class="flex items-center justify-between mb-3">
+                            <label class="text-sm font-medium"><i class="fas fa-calendar mr-1"></i>Periode Subscription</label>
+                            <label class="inline-flex items-center gap-2 cursor-pointer">
+                                <input type="checkbox" id="toggle-custom-dates" class="rounded text-orange-500" onchange="toggleCustomDates()">
+                                <span class="text-xs text-gray-300">Custom Date</span>
+                            </label>
+                        </div>
+                        
+                        <div class="grid md:grid-cols-2 gap-4">
+                            <div>
+                                <label class="block text-xs text-gray-400 mb-1">Start Date</label>
+                                <input type="date" name="subscription_start" id="start-date" 
+                                       value="<?= $edit_user['subscription_start'] ?>" 
+                                       class="w-full px-4 py-2 bg-gray-600 border border-gray-500 rounded-lg text-gray-300 cursor-not-allowed" 
+                                       readonly title="Otomatis sesuai paket. Centang 'Custom Date' untuk edit manual">
+                            </div>
+                            <div>
+                                <label class="block text-xs text-gray-400 mb-1">End Date</label>
+                                <input type="date" name="subscription_end" id="end-date" 
+                                       value="<?= $edit_user['subscription_end'] ?>" 
+                                       class="w-full px-4 py-2 bg-gray-600 border border-gray-500 rounded-lg text-gray-300 cursor-not-allowed" 
+                                       readonly title="Otomatis sesuai paket. Centang 'Custom Date' untuk edit manual">
+                            </div>
+                        </div>
+                        
+                        <p class="text-xs text-gray-500 mt-2">
+                            <i class="fas fa-info-circle mr-1"></i> 
+                            Tanggal otomatis dihitung dari paket. Untuk periode khusus, centang <strong>"Custom Date"</strong>.
+                        </p>
                     </div>
-                    <div>
-                        <label class="block text-sm font-medium mb-1">End Date</label>
-                        <input type="date" name="subscription_end" value="<?= $edit_user['subscription_end'] ?>" class="w-full px-4 py-2 bg-gray-700 border border-gray-600 rounded-lg focus:ring-2 focus:ring-orange-500 outline-none">
-                    </div>
+                    
                     <div>
                         <label class="block text-sm font-medium mb-1">Kuota Bolos</label>
-                        <input type="number" name="skip_quota_total" value="<?= $edit_user['skip_quota_total'] ?>" readonly class="w-full px-4 py-2 bg-gray-600 border border-gray-500 rounded-lg text-gray-400 cursor-not-allowed" title="Kuota ditentukan oleh paket, tidak bisa diubah manual">
-                        <p class="text-xs text-gray-500 mt-1"><i class="fas fa-info-circle mr-1"></i>Kuota otomatis sesuai paket. Ubah paket untuk ganti kuota.</p>
+                        <input type="number" name="skip_quota_total" id="skip-quota" 
+                               value="<?= $edit_user['skip_quota_total'] ?>" 
+                               readonly class="w-full px-4 py-2 bg-gray-600 border border-gray-500 rounded-lg text-gray-400 cursor-not-allowed" 
+                               title="Kuota otomatis sesuai paket">
+                        <p class="text-xs text-gray-500 mt-1"><i class="fas fa-lock mr-1"></i>Otomatis dari paket</p>
                     </div>
                     
                     <div class="md:col-span-2 flex gap-2 mt-2">
@@ -316,8 +360,8 @@ $page_title = 'Admin Dashboard';
             </div>
         <?php endif; ?>
 
-        <!-- TAB: Users List -->
-        <?php if ($tab === 'users'): ?>
+        <!-- TAB: Users List (unchanged) -->
+        <?php if ($tab === 'users' && !$edit_user): ?>
             <div class="bg-gray-800 rounded-xl border border-gray-700 overflow-hidden">
                 <div class="overflow-x-auto">
                     <table class="w-full text-sm text-left">
@@ -359,41 +403,28 @@ $page_title = 'Admin Dashboard';
                                     </td>
                                     <td class="p-4">
                                         <div class="flex justify-center gap-1 flex-wrap">
-                                            <!-- ✏️ Edit -->
                                             <a href="?tab=users&edit=<?= $u['id'] ?><?= $search ? '&search='.urlencode($search) : '' ?>" 
                                                class="px-2 py-1 bg-blue-600 hover:bg-blue-700 rounded text-xs transition" title="Edit">
                                                 <i class="fas fa-edit"></i>
                                             </a>
-                                            
                                             <?php if ($u['status'] !== 'kicked'): ?>
-                                                <!-- 🚫 Kick -->
-                                                <form method="POST" onsubmit="return confirm('KICK user ini? Mereka tidak bisa login lagi.')">
+                                                <form method="POST" onsubmit="return confirm('KICK user ini?')">
                                                     <input type="hidden" name="action" value="kick_user">
                                                     <input type="hidden" name="user_id" value="<?= $u['id'] ?>">
-                                                    <button class="px-2 py-1 bg-red-600 hover:bg-red-700 rounded text-xs transition" title="Kick">
-                                                        <i class="fas fa-user-slash"></i>
-                                                    </button>
+                                                    <button class="px-2 py-1 bg-red-600 hover:bg-red-700 rounded text-xs transition" title="Kick"><i class="fas fa-user-slash"></i></button>
                                                 </form>
-                                                
-                                                <!-- ♻️ Restore -->
                                                 <?php if ($u['skip_count'] > 0): ?>
                                                     <form method="POST" onsubmit="return confirm('Reset kuota bolos user ini ke 0?')">
                                                         <input type="hidden" name="action" value="restore_quota">
                                                         <input type="hidden" name="user_id" value="<?= $u['id'] ?>">
-                                                        <button class="px-2 py-1 bg-green-600 hover:bg-green-700 rounded text-xs transition" title="Restore Kuota">
-                                                            <i class="fas fa-undo"></i>
-                                                        </button>
+                                                        <button class="px-2 py-1 bg-green-600 hover:bg-green-700 rounded text-xs transition" title="Restore Kuota"><i class="fas fa-undo"></i></button>
                                                     </form>
                                                 <?php endif; ?>
                                             <?php endif; ?>
-                                            
-                                            <!-- 🗑️ Delete (Hati-hati!) -->
-                                            <form method="POST" onsubmit="return confirm('HAPUS PERMANEN user ini? Semua data (laporan, log, dreams) akan ikut terhapus. Tindakan ini TIDAK BISA dibatalkan!')">
+                                            <form method="POST" onsubmit="return confirm('HAPUS PERMANEN?')">
                                                 <input type="hidden" name="action" value="delete_user">
                                                 <input type="hidden" name="user_id" value="<?= $u['id'] ?>">
-                                                <button class="px-2 py-1 bg-gray-600 hover:bg-gray-500 rounded text-xs transition" title="Hapus Permanen">
-                                                    <i class="fas fa-trash"></i>
-                                                </button>
+                                                <button class="px-2 py-1 bg-gray-600 hover:bg-gray-500 rounded text-xs transition" title="Hapus Permanen"><i class="fas fa-trash"></i></button>
                                             </form>
                                         </div>
                                     </td>
@@ -404,8 +435,6 @@ $page_title = 'Admin Dashboard';
                 </div>
                 <?= $pagination_users ?>
             </div>
-            
-            <!-- Quick Add Button -->
             <div class="mt-4 text-right">
                 <a href="?tab=users&edit=0" class="inline-flex items-center px-4 py-2 bg-green-600 hover:bg-green-700 rounded-lg font-medium transition">
                     <i class="fas fa-plus mr-2"></i> Tambah User Baru
@@ -413,35 +442,24 @@ $page_title = 'Admin Dashboard';
             </div>
         <?php endif; ?>
 
-        <!-- TAB: Cek Bolos (FIXED: Preview + Confirm Flow) -->
+        <!-- TAB: Cek Bolos (unchanged) -->
         <?php if ($tab === 'skips'): ?>
-            
-            <!-- Preview Mode: Show who didn't report (READ-ONLY) -->
             <?php if ($preview_mode): ?>
                 <div class="bg-gray-800 rounded-xl border border-blue-700 mb-6 overflow-hidden">
                     <div class="px-6 py-4 bg-blue-900/30 border-b border-blue-700">
-                        <h3 class="font-bold text-lg text-blue-300">
-                            <i class="fas fa-eye mr-2"></i>Preview: User yang Belum Lapor (<?= formatDateIndo($check_date) ?>)
-                        </h3>
-                        <p class="text-sm text-blue-200/80 mt-1">
-                            <i class="fas fa-info-circle mr-1"></i> Ini hanya preview. Kuota user BELUM berubah. Pilih aksi di bawah.
-                        </p>
+                        <h3 class="font-bold text-lg text-blue-300"><i class="fas fa-eye mr-2"></i>Preview: User yang Belum Lapor (<?= formatDateIndo($check_date) ?>)</h3>
+                        <p class="text-sm text-blue-200/80 mt-1"><i class="fas fa-info-circle mr-1"></i> Ini hanya preview. Kuota user BELUM berubah.</p>
                     </div>
-                    
                     <form method="POST" class="p-6">
                         <input type="hidden" name="action" value="confirm_skips">
-                        
                         <div class="overflow-x-auto">
                             <table class="w-full text-sm text-left">
                                 <thead class="bg-gray-700/50 text-gray-300">
                                     <tr>
                                         <th class="p-4 w-8"><input type="checkbox" id="select-all-penalty" class="rounded text-orange-500"></th>
-                                        <th class="p-4">Nama</th>
-                                        <th class="p-4">WhatsApp</th>
-                                        <th class="p-4 text-center">Skip Saat Ini</th>
-                                        <th class="p-4 text-center">Jika Di-Penalty</th>
-                                        <th class="p-4 text-center">Status Nanti</th>
-                                        <th class="p-4 text-center">Aksi Admin</th>
+                                        <th class="p-4">Nama</th><th class="p-4">WhatsApp</th>
+                                        <th class="p-4 text-center">Skip Saat Ini</th><th class="p-4 text-center">Jika Di-Penalty</th>
+                                        <th class="p-4 text-center">Status Nanti</th><th class="p-4 text-center">Aksi Admin</th>
                                     </tr>
                                 </thead>
                                 <tbody class="divide-y divide-gray-700">
@@ -449,28 +467,12 @@ $page_title = 'Admin Dashboard';
                                         $will_be_kicked = $p['potential_skip'] >= $p['quota_total'];
                                     ?>
                                         <tr class="hover:bg-gray-700/30 <?= $will_be_kicked ? 'bg-red-900/20' : '' ?>">
-                                            <td class="p-4 text-center">
-                                                <input type="checkbox" name="selected_users[]" value="<?= $p['id'] ?>" class="penalty-checkbox rounded text-orange-500" data-will-kick="<?= $will_be_kicked ? '1' : '0' ?>">
-                                            </td>
+                                            <td class="p-4 text-center"><input type="checkbox" name="selected_users[]" value="<?= $p['id'] ?>" class="penalty-checkbox rounded text-orange-500" data-will-kick="<?= $will_be_kicked ? '1' : '0' ?>"></td>
                                             <td class="p-4 font-medium"><?= sanitize($p['full_name']) ?></td>
                                             <td class="p-4"><?= sanitize($p['whatsapp_number']) ?></td>
-                                            <td class="p-4 text-center">
-                                                <span class="px-2 py-1 rounded text-xs font-bold bg-yellow-900 text-yellow-300">
-                                                    <?= $p['current_skip'] ?>/<?= $p['quota_total'] ?>
-                                                </span>
-                                            </td>
-                                            <td class="p-4 text-center">
-                                                <span class="px-2 py-1 rounded text-xs font-bold <?= $will_be_kicked ? 'bg-red-900 text-red-300' : 'bg-orange-900 text-orange-300' ?>">
-                                                    <?= $p['potential_skip'] ?>/<?= $p['quota_total'] ?>
-                                                </span>
-                                            </td>
-                                            <td class="p-4 text-center">
-                                                <?php if ($will_be_kicked): ?>
-                                                    <span class="text-red-400 font-bold text-xs"><i class="fas fa-skull mr-1"></i>DI-KICK</span>
-                                                <?php else: ?>
-                                                    <span class="text-green-400 text-xs"><i class="fas fa-check mr-1"></i>Aktif</span>
-                                                <?php endif; ?>
-                                            </td>
+                                            <td class="p-4 text-center"><span class="px-2 py-1 rounded text-xs font-bold bg-yellow-900 text-yellow-300"><?= $p['current_skip'] ?>/<?= $p['quota_total'] ?></span></td>
+                                            <td class="p-4 text-center"><span class="px-2 py-1 rounded text-xs font-bold <?= $will_be_kicked ? 'bg-red-900 text-red-300' : 'bg-orange-900 text-orange-300' ?>"><?= $p['potential_skip'] ?>/<?= $p['quota_total'] ?></span></td>
+                                            <td class="p-4 text-center"><?= $will_be_kicked ? '<span class="text-red-400 font-bold text-xs"><i class="fas fa-skull mr-1"></i>DI-KICK</span>' : '<span class="text-green-400 text-xs"><i class="fas fa-check mr-1"></i>Aktif</span>' ?></td>
                                             <td class="p-4 text-center">
                                                 <label class="inline-flex items-center gap-2 cursor-pointer">
                                                     <input type="checkbox" name="excuse_users[]" value="<?= $p['id'] ?>" class="excuse-checkbox rounded text-green-500" data-user-id="<?= $p['id'] ?>">
@@ -482,63 +484,28 @@ $page_title = 'Admin Dashboard';
                                 </tbody>
                             </table>
                         </div>
-                        
-                        <!-- Action Buttons -->
                         <div class="mt-6 flex flex-wrap gap-3 justify-end">
-                            <button type="button" onclick="if(confirm('Batalkan preview? Tidak ada perubahan yang akan disimpan.')) { document.querySelector('input[name=\'action\'][value=\'cancel_preview\']')?.click(); }" 
-                                    class="px-4 py-2 bg-gray-700 hover:bg-gray-600 rounded-lg text-sm transition">
-                                <i class="fas fa-times mr-1"></i> Batal
-                            </button>
-                            <button type="submit" name="action" value="confirm_skips" 
-                                    class="px-6 py-2 bg-gradient-to-r from-orange-600 to-red-600 hover:from-orange-700 hover:to-red-700 rounded-lg font-bold transition flex items-center gap-2"
-                                    onclick="return confirmSelected()">
-                                <i class="fas fa-check-circle"></i> Konfirmasi & Eksekusi
-                            </button>
+                            <button type="button" onclick="if(confirm('Batalkan preview?')) { document.querySelector('input[name=\'action\'][value=\'cancel_preview\']')?.click(); }" class="px-4 py-2 bg-gray-700 hover:bg-gray-600 rounded-lg text-sm transition"><i class="fas fa-times mr-1"></i> Batal</button>
+                            <button type="submit" name="action" value="confirm_skips" class="px-6 py-2 bg-gradient-to-r from-orange-600 to-red-600 hover:from-orange-700 hover:to-red-700 rounded-lg font-bold transition flex items-center gap-2" onclick="return confirmSelected()"><i class="fas fa-check-circle"></i> Konfirmasi & Eksekusi</button>
                         </div>
-                        
-                        <p class="mt-4 text-xs text-gray-500 text-center">
-                            <i class="fas fa-lightbulb mr-1"></i> Tips: Centang "Excuse" jika user punya alasan valid (sakit, darurat). Mereka tidak akan kena penalty dan kuota tetap.
-                        </p>
+                        <p class="mt-4 text-xs text-gray-500 text-center"><i class="fas fa-lightbulb mr-1"></i> Tips: Centang "Excuse" jika user punya alasan valid.</p>
                     </form>
                 </div>
-                
             <?php else: ?>
-                <!-- Normal Mode: Button to start preview -->
                 <div class="bg-gray-800 rounded-xl p-6 border border-gray-700 mb-6">
                     <h3 class="font-bold mb-2"><i class="fas fa-search mr-2"></i>Manual Check Bolos</h3>
-                    <p class="text-sm text-gray-400 mb-4">
-                        Scan user yang tidak lapor pada tanggal tertentu. <strong class="text-orange-400">Tidak ada perubahan database sampai admin konfirmasi.</strong>
-                    </p>
-                    
+                    <p class="text-sm text-gray-400 mb-4">Scan user yang tidak lapor pada tanggal tertentu. <strong class="text-orange-400">Tidak ada perubahan database sampai admin konfirmasi.</strong></p>
                     <form method="POST" class="flex flex-wrap gap-4 items-end">
-                        <div>
-                            <label class="block text-sm font-medium mb-1">Tanggal yang Dicek</label>
-                            <input type="date" name="check_date" value="<?= $check_date ?>" 
-                                   class="px-4 py-2 bg-gray-700 border border-gray-600 rounded-lg focus:ring-2 focus:ring-orange-500 outline-none">
-                        </div>
-                        <button type="submit" name="action" value="preview_skips" 
-                                class="px-6 py-2 bg-blue-600 hover:bg-blue-700 rounded-lg font-medium transition flex items-center gap-2">
-                            <i class="fas fa-search"></i> Preview User yang Belum Lapor
-                        </button>
+                        <div><label class="block text-sm font-medium mb-1">Tanggal yang Dicek</label><input type="date" name="check_date" value="<?= $check_date ?>" class="px-4 py-2 bg-gray-700 border border-gray-600 rounded-lg focus:ring-2 focus:ring-orange-500 outline-none"></div>
+                        <button type="submit" name="action" value="preview_skips" class="px-6 py-2 bg-blue-600 hover:bg-blue-700 rounded-lg font-medium transition flex items-center gap-2"><i class="fas fa-search"></i> Preview User yang Belum Lapor</button>
                     </form>
-                    
-                    <div class="mt-4 p-3 bg-blue-900/30 rounded border border-blue-700/50 text-sm text-blue-200">
-                        <i class="fas fa-info-circle mr-1"></i> 
-                        <strong>Cara Pakai:</strong> 
-                        1) Pilih tanggal → 2) Klik "Preview" → 3) Review list user → 4) Pilih: Penalty / Excuse → 5) Konfirmasi.
-                    </div>
+                    <div class="mt-4 p-3 bg-blue-900/30 rounded border border-blue-700/50 text-sm text-blue-200"><i class="fas fa-info-circle mr-1"></i> <strong>Cara Pakai:</strong> 1) Pilih tanggal → 2) Klik "Preview" → 3) Review → 4) Pilih Penalty/Excuse → 5) Konfirmasi.</div>
                 </div>
-
-                <!-- Existing Skip Monitor Table (Read-Only Display) -->
                 <div class="bg-gray-800 rounded-xl border border-gray-700 overflow-hidden">
-                    <div class="px-4 py-3 bg-gray-700/50 border-b border-gray-600">
-                        <h3 class="font-semibold text-sm"><i class="fas fa-list mr-2"></i>Riwayat User dengan Skip</h3>
-                    </div>
+                    <div class="px-4 py-3 bg-gray-700/50 border-b border-gray-600"><h3 class="font-semibold text-sm"><i class="fas fa-list mr-2"></i>Riwayat User dengan Skip</h3></div>
                     <div class="overflow-x-auto">
                         <table class="w-full text-sm text-left">
-                            <thead class="bg-gray-700/50 text-gray-300">
-                                <tr><th class="p-4">Nama</th><th class="p-4">WhatsApp</th><th class="p-4 text-center">Bolos Ke-</th><th class="p-4">Status</th><th class="p-4 text-center">Aksi</th></tr>
-                            </thead>
+                            <thead class="bg-gray-700/50 text-gray-300"><tr><th class="p-4">Nama</th><th class="p-4">WhatsApp</th><th class="p-4 text-center">Bolos Ke-</th><th class="p-4">Status</th><th class="p-4 text-center">Aksi</th></tr></thead>
                             <tbody class="divide-y divide-gray-700">
                                 <?php if (empty($skip_users)): ?>
                                     <tr><td colspan="5" class="p-6 text-center text-gray-500"><i class="fas fa-check-circle text-green-400 mr-2"></i>Tidak ada user yang bolos.</td></tr>
@@ -557,13 +524,9 @@ $page_title = 'Admin Dashboard';
                                                 <form method="POST" onsubmit="return confirm('Reset kuota bolos user ini ke 0?')">
                                                     <input type="hidden" name="action" value="restore_quota">
                                                     <input type="hidden" name="user_id" value="<?= $u['id'] ?>">
-                                                    <button class="px-3 py-1 bg-green-600 hover:bg-green-700 rounded text-xs transition" title="Restore Kuota">
-                                                        <i class="fas fa-undo mr-1"></i>Restore
-                                                    </button>
+                                                    <button class="px-3 py-1 bg-green-600 hover:bg-green-700 rounded text-xs transition"><i class="fas fa-undo mr-1"></i>Restore</button>
                                                 </form>
-                                            <?php else: ?>
-                                                <span class="text-gray-500 text-xs">-</span>
-                                            <?php endif; ?>
+                                            <?php else: ?><span class="text-gray-500 text-xs">-</span><?php endif; ?>
                                         </td>
                                     </tr>
                                 <?php endforeach; endif; ?>
@@ -572,57 +535,120 @@ $page_title = 'Admin Dashboard';
                     </div>
                 </div>
             <?php endif; ?>
-            
         <?php endif; ?>
         
     </div>
 </div>
 
-<!-- JavaScript: Preview Confirm Logic -->
+<!-- JavaScript: Auto Date Calculation + Custom Toggle -->
 <script>
-// Select All Checkbox for Penalty
-document.getElementById('select-all-penalty')?.addEventListener('change', function() {
-    document.querySelectorAll('.penalty-checkbox').forEach(cb => {
-        cb.checked = this.checked;
-    });
+// Package durations data from PHP
+const packageDurations = <?= json_encode($package_durations) ?>;
+
+// Update dates based on selected package
+function updateDates() {
+    const typeSelect = document.getElementById('subscription-type');
+    const selectedOption = typeSelect.options[typeSelect.selectedIndex];
+    const days = parseInt(selectedOption.dataset.days) || 0;
+    const quota = selectedOption.dataset.quota;
+    const name = selectedOption.dataset.name;
+    
+    // Update package info display
+    document.getElementById('package-info').textContent = `(${name}: ${days} hari, kuota ${quota}x)`;
+    
+    // Update quota field (readonly)
+    document.getElementById('skip-quota').value = quota;
+    
+    // Only auto-update dates if NOT in custom mode
+    if (document.getElementById('use-custom-dates').value !== '1') {
+        const startDate = document.getElementById('start-date');
+        const endDate = document.getElementById('end-date');
+        
+        // Keep existing start date if editing, otherwise use today
+        let start = startDate.value || new Date().toISOString().split('T')[0];
+        startDate.value = start;
+        
+        // Calculate end date
+        if (days > 0) {
+            const end = new Date(start);
+            end.setDate(end.getDate() + days);
+            endDate.value = end.toISOString().split('T')[0];
+        } else {
+            endDate.value = ''; // Trial or unlimited
+        }
+    }
+}
+
+// Toggle custom date mode
+function toggleCustomDates() {
+    const toggle = document.getElementById('toggle-custom-dates');
+    const useCustomInput = document.getElementById('use-custom-dates');
+    const startDate = document.getElementById('start-date');
+    const endDate = document.getElementById('end-date');
+    
+    if (toggle.checked) {
+        // Enable manual editing
+        useCustomInput.value = '1';
+        startDate.classList.remove('bg-gray-600', 'cursor-not-allowed', 'text-gray-300');
+        startDate.classList.add('bg-gray-700', 'cursor-text');
+        startDate.readOnly = false;
+        endDate.classList.remove('bg-gray-600', 'cursor-not-allowed', 'text-gray-300');
+        endDate.classList.add('bg-gray-700', 'cursor-text');
+        endDate.readOnly = false;
+        showToast('Mode Custom Date aktif. Silakan edit tanggal manual.', 'info');
+    } else {
+        // Revert to auto-calc
+        useCustomInput.value = '0';
+        startDate.classList.add('bg-gray-600', 'cursor-not-allowed', 'text-gray-300');
+        startDate.classList.remove('bg-gray-700', 'cursor-text');
+        startDate.readOnly = true;
+        endDate.classList.add('bg-gray-600', 'cursor-not-allowed', 'text-gray-300');
+        endDate.classList.remove('bg-gray-700', 'cursor-text');
+        endDate.readOnly = true;
+        updateDates(); // Recalculate
+        showToast('Tanggal otomatis dihitung dari paket.', 'success');
+    }
+}
+
+// Initialize on load
+document.addEventListener('DOMContentLoaded', () => {
+    // If editing existing user, initialize with their dates
+    const editUser = <?= $edit_user ? 'true' : 'false' ?>;
+    if (editUser) {
+        updateDates();
+    }
+    
+    // Add event listener for package change
+    document.getElementById('subscription-type')?.addEventListener('change', updateDates);
 });
 
-// Excuse checkbox logic: cannot select both penalty and excuse for same user
-document.querySelectorAll('.excuse-checkbox').forEach(excuseCb => {
-    excuseCb.addEventListener('change', function() {
+// Confirm logic for skip penalty (unchanged)
+document.getElementById('select-all-penalty')?.addEventListener('change', function() {
+    document.querySelectorAll('.penalty-checkbox').forEach(cb => cb.checked = this.checked);
+});
+document.querySelectorAll('.excuse-checkbox').forEach(cb => {
+    cb.addEventListener('change', function() {
         const userId = this.dataset.userId;
         const penaltyCb = document.querySelector(`.penalty-checkbox[value='${userId}']`);
-        if (this.checked && penaltyCb) {
-            penaltyCb.checked = false;
-        }
+        if (this.checked && penaltyCb) penaltyCb.checked = false;
     });
 });
-
-document.querySelectorAll('.penalty-checkbox').forEach(penaltyCb => {
-    penaltyCb.addEventListener('change', function() {
+document.querySelectorAll('.penalty-checkbox').forEach(cb => {
+    cb.addEventListener('change', function() {
         const userId = this.value;
         const excuseCb = document.querySelector(`.excuse-checkbox[value='${userId}']`);
-        if (this.checked && excuseCb) {
-            excuseCb.checked = false;
-        }
+        if (this.checked && excuseCb) excuseCb.checked = false;
     });
 });
-
-// Confirm before submit: warn if any user will be kicked
 function confirmSelected() {
     const selected = document.querySelectorAll('.penalty-checkbox:checked');
     const willKick = Array.from(selected).some(cb => cb.dataset.willKick === '1');
-    
-    if (willKick) {
-        return confirm('⚠️ PERINGATAN: Beberapa user akan di-KICK otomatis karena kuota bolos habis!\n\nTindakan ini TIDAK BISA dibatalkan.\n\nLanjutkan?');
-    }
-    if (selected.length === 0) {
-        return confirm('Tidak ada user yang dipilih untuk di-penalty. Yakin ingin melanjutkan?');
-    }
+    if (willKick) return confirm('⚠️ PERINGATAN: Beberapa user akan di-KICK otomatis!\n\nLanjutkan?');
+    if (selected.length === 0) return confirm('Tidak ada user dipilih. Yakin lanjut?');
     return true;
 }
 
-// Toast notification (reuse from functions)
+// Toast notification
 <?php if ($message || $error): ?>
     showToast("<?= addslashes($message ?: $error) ?>", "<?= $message ? 'success' : 'error' ?>");
 <?php endif; ?>

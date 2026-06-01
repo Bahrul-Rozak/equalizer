@@ -580,7 +580,7 @@ $page_title = 'Home';
                 ['q' => 'Gue takut di-KICK, malu dong...', 'a' => 'Bagus. Rasa malu itu sehat. Itu artinya lo peduli. Tapi ingat: lebih malu mana? Di-KICK dari grup, atau nyesel seumur hidup karena gak pernah mulai?'],
                 ['q' => 'Lo siapa sih berani-beraninya paksa orang?', 'a' => 'Gw? Gw cuma orang yang capek liat potensi terkubur. Gw gak maksa, gw cuma nyediain sistem. Lo yang pilih: ikut atau nggak.'],
                 ['q' => 'Kalau gue gagal gimana?', 'a' => 'Gagal itu bagian dari proses. Yang gak boleh gagal: BERHENTI. Selama lo masih lapor, masih usaha, lo masih warrior. Gagal hari ini? Besok bangkit lagi.'],
-                ['q' => 'Ini kan mahal ya...', 'a' => 'Mahal mana: Rp 50.000/bulan, atau mimpi lo yang terkubur selamanya? Investasi termahal itu waktu. Gw cuma bantu lo hemat waktu dengan paksa lo fokus.'],
+                ['q' => 'Ini kan mahal ya...', 'a' => 'Mahal mana: Rp 15.000/bulan, atau mimpi lo yang terkubur selamanya? Investasi termahal itu waktu. Gw cuma bantu lo hemat waktu dengan paksa lo fokus.'],
             ];
             
             foreach ($faqs as $i => $faq): ?>

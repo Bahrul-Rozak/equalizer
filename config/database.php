@@ -5,6 +5,11 @@ define('DB_NAME', 'equalizer');
 define('DB_USER', 'root');
 define('DB_PASS', ''); 
 
+// define('DB_HOST', 'localhost');
+// define('DB_NAME', 'daysofwa_dominance');
+// define('DB_USER', 'daysofwa_creator');
+// define('DB_PASS', 'x[&qA~K-iRK[a2m2'); 
+
 function getDBConnection() {
     static $pdo = null;
     
